@@ -1,5 +1,6 @@
 /* Created 2024 by David de Andres Hernandez @ imdea.org */
 
+#include <signal.h>
 #include <rte_common.h>
 #include <rte_ethdev.h>
 #include <rte_eal.h>
@@ -15,6 +16,11 @@
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
 
+#define MAX_LCORES RTE_MAX_LCORE
+
+// Array to track TX queue ID for each lcore
+uint16_t lcore_to_tx_queue[MAX_LCORES];
+
 static const struct rte_ether_addr dst_mac = {
     .addr_bytes = {0xf8, 0x8e, 0xa1, 0x12, 0xf8, 0xe1} //
 };
@@ -25,15 +31,30 @@ static uint16_t src_port = 12345;
 static uint32_t src_ip = RTE_IPV4(192, 168, 1, 1);
 static uint32_t dst_ip = RTE_IPV4(192, 168, 1, 2);
 
+
+static volatile bool keep_running = true;
+
+// Signal handler for graceful shutdown
+static void handle_sigint(const int sig) {
+	if (sig == SIGINT) {
+		keep_running = false;
+	}
+	printf("Received SIGINT. Shutting down...\n");
+	// fflush(stdout);
+}
+
 static void generate_packets(struct rte_mempool *mbuf_pool) {
 	uint16_t portid;
     struct rte_mbuf *pkts[BURST_SIZE];
     uint16_t dst_port = dst_port_start;
 
-	printf("\nCore %u forwarding packets. [Ctrl+C to quit]\n",
-			rte_lcore_id());
+	// Get the core id
+	unsigned lcore_id = rte_lcore_id();
+	uint16_t tx_queue_id = lcore_to_tx_queue[lcore_id];
 
-	while (1) {
+	printf("\nCore %u forwarding packets.\n",  lcore_id);
+
+	while (keep_running) {
 		RTE_ETH_FOREACH_DEV(portid) {
 			if (!rte_eth_dev_is_valid_port(portid)) {
 				continue;
@@ -42,7 +63,7 @@ static void generate_packets(struct rte_mempool *mbuf_pool) {
 				pkts[i] = rte_pktmbuf_alloc(mbuf_pool);
 				if (pkts[i] == NULL) {
 					printf("Failed to allocate mbuf\n");
-					return;
+					continue;
 				}
 
 				struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr *);
@@ -77,25 +98,27 @@ static void generate_packets(struct rte_mempool *mbuf_pool) {
 				}
 			}
 
-			uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts, BURST_SIZE);
-			// printf("Transmitted %u packets\n", nb_tx);
-
-			for (int i = nb_tx; i < BURST_SIZE; i++) {
-				rte_pktmbuf_free(pkts[i]);
-			}
+			uint16_t to_send = BURST_SIZE;
+			uint16_t nb_tx = 0;
+			int sent;
+			do {
+				sent = rte_eth_tx_burst(portid, tx_queue_id, pkts, to_send);
+				to_send -= sent;
+				nb_tx += sent;
+			} while (to_send > 0);
 		}
 	}
+	printf("Stopping packet transmission on lcore %u for port %u\n", rte_lcore_id(), portid);
+	// fflush(stdout);
 }
 
 /* Main functional part of port initialization. 8< */
 static inline int
-port_init(uint16_t port, struct rte_mempool *mbuf_pool)
-{
+port_init(uint16_t port) {
 	struct rte_eth_conf port_conf;
-	const uint16_t tx_rings = 1;
+	const uint16_t tx_rings = rte_lcore_count()-1;
 	uint16_t nb_txd = TX_RING_SIZE;
 	int retval;
-	uint16_t q;
 	struct rte_eth_dev_info dev_info;
 	struct rte_eth_txconf txconf;
 
@@ -125,15 +148,25 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 		return retval;
 
 	/* Allocate and set up 1 TX queue per Ethernet port. */
-	txconf = dev_info.default_txconf;
-	txconf.offloads = port_conf.txmode.offloads;
-	for (q = 0; q < tx_rings; q++) {
-		retval = rte_eth_tx_queue_setup(port, q, nb_txd,
-				rte_eth_dev_socket_id(port), &txconf);
-		if (retval < 0)
-			return retval;
-	}
+	unsigned lcore_id;
+	uint16_t tx_queue_id = 0; // Sequential TX queue ID
+	RTE_LCORE_FOREACH_WORKER(lcore_id) {
+		if (tx_queue_id >= tx_rings) {
+			rte_exit(EXIT_FAILURE, "Not enough TX queues for all lcores\n");
+		}
 
+		// Map lcore to TX queue
+		lcore_to_tx_queue[lcore_id] = tx_queue_id;
+
+		txconf = dev_info.default_txconf;
+		txconf.offloads = port_conf.txmode.offloads;
+		retval = rte_eth_tx_queue_setup(port, tx_queue_id, nb_txd,
+				rte_eth_dev_socket_id(port), &txconf);
+		if (retval < 0)	{
+			return retval;
+		}
+		tx_queue_id++;
+	}
 	/* Starting Ethernet port. 8< */
 	retval = rte_eth_dev_start(port);
 	/* >8 End of starting of ethernet port. */
@@ -154,10 +187,28 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 }
 /* >8 End of main functional part of port initialization. */
 
+// Packet sending function for each core
+static int send_packets_on_lcore(__attribute__((unused)) void *arg) {
+	printf("Sending packets on lcore %u\n", rte_lcore_id());
+
+	struct rte_mempool *mbuf_pool = (struct rte_mempool *)arg;  // Using the same mbuf pool
+
+	// Sending packets
+	generate_packets(mbuf_pool);
+
+	return 0;
+}
+
 int main(int argc, char *argv[]) {
     struct rte_mempool *mbuf_pool;
     unsigned nb_ports;
     uint16_t portid;
+
+	// Set stdout to unbuffered
+	setbuf(stdout, NULL);
+
+	// Register signal handler for SIGINT
+	signal(SIGINT, handle_sigint);
 
     /* Initializion the Environment Abstraction Layer (EAL). 8< */
     int ret = rte_eal_init(argc, argv);
@@ -170,37 +221,49 @@ int main(int argc, char *argv[]) {
     nb_ports = rte_eth_dev_count_avail();
 
     /* Allocates mempool to hold the mbufs. 8< */
-    mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports,MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+    mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports,MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, (int) rte_socket_id());
     if (mbuf_pool == NULL) {
         rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
     }
     printf("Created mbuf pool\n");
     /* >8 End of allocating mempool to hold mbuf. */
 
-    /* Initializing port. 8< */
-	// portid = 0;
+	/* Initializing port. 8< */
 	RTE_ETH_FOREACH_DEV(portid) {
 		ret = rte_eth_dev_is_valid_port(portid);
 		if (!ret) {
 			printf("Invalid port_id=%u\n", portid);
 			continue;
 		}
-		if (port_init(portid, mbuf_pool) != 0) {
+		if (port_init(portid) != 0) {
 			rte_exit(EXIT_FAILURE, "Cannot init port %"PRIu16 "\n",
 					portid);
 		}
 		printf("Configured port %"PRIu16 "\n", portid);
 	}
-    /* >8 End of initializing all ports. */
+	/* >8 End of initializing all ports. */
 
+	printf("Starting packet forwarding. [Ctrl+C to quit]\n");
 
-    generate_packets(mbuf_pool);
+	// Launch the packet sending function on multiple lcores
+	unsigned lcore_id;
+	RTE_LCORE_FOREACH_WORKER(lcore_id) {
+		if (rte_lcore_is_enabled(lcore_id)) {
+			printf("Starting lcore %u\n", lcore_id);
+			rte_eal_remote_launch(send_packets_on_lcore, mbuf_pool, lcore_id);
+		}
+	}
+
+	rte_eal_mp_wait_lcore();
+
 	RTE_ETH_FOREACH_DEV(portid) {
 		if (!rte_eth_dev_is_valid_port(portid)) {
 			continue;
 		}
 		rte_eth_dev_stop(portid);
 		rte_eth_dev_close(portid);
+		printf("Port %u stopped and closed\n", portid);
 	}
+	printf("Application exiting\n");
     return 0;
 }
