@@ -18,6 +18,19 @@
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
+#define PKT_SIZE 64
+
+#define Million (uint64_t)(1000000UL)
+
+enum {
+	INTER_FRAME_GAP       = 12, /**< in bytes */
+	START_FRAME_DELIMITER = 1,  /**< Starting frame delimiter bytes */
+	PKT_PREAMBLE_SIZE     = 7,  /**< in bytes */
+	PKT_OVERHEAD_SIZE =
+		(INTER_FRAME_GAP + START_FRAME_DELIMITER + PKT_PREAMBLE_SIZE + RTE_ETHER_CRC_LEN),
+};
+
+#define WIRE_SIZE(pkt_size, t) (t)(pkt_size + PKT_OVERHEAD_SIZE)
 
 #define MAX_LCORES RTE_MAX_LCORE
 
@@ -32,19 +45,22 @@ static uint64_t lcore_pkt_counts[RTE_MAX_LCORE] = {0};
 uint16_t nb_tx_lcores;
 static uint16_t stats_worker_id;
 
+static uint16_t pkt_size = PKT_SIZE;
+
 
 static const struct rte_ether_addr dst_mac = {
     .addr_bytes = {0xf8, 0x8e, 0xa1, 0x12, 0xf8, 0xe1} //
 };
 
 static uint16_t dst_port_start = 1024;
-static uint16_t num_flows = 100;
+static uint16_t num_flows;
 static uint16_t src_port = 12345;
 static uint32_t src_ip = RTE_IPV4(192, 168, 1, 1);
 static uint32_t dst_ip = RTE_IPV4(192, 168, 1, 2);
 
 
 static volatile bool keep_running = true;
+static uint64_t tx_cycles;
 
 // Signal handler for graceful shutdown
 static void handle_sigint(const int sig) {
@@ -52,6 +68,33 @@ static void handle_sigint(const int sig) {
 		keep_running = false;
 	}
 	RTE_LOG(INFO, FLOWGEN,"Received SIGINT. Shutting down...\n");
+}
+
+void
+set_packet_rate(uint16_t rate, uint16_t portid)
+{
+	uint64_t link_speed, wire_size, pps, cpb;
+
+
+	struct rte_eth_link link = {0};
+
+	if (rte_eth_link_get_nowait(portid, &link) == 0) {
+		if (link.link_status == RTE_ETH_LINK_UP) {
+			link_speed   = link.link_speed;
+		}
+	}
+
+	wire_size = 8 * WIRE_SIZE((pkt_size - RTE_ETHER_CRC_LEN), uint64_t);
+
+	link_speed = (uint64_t)link_speed * Million;
+	pps        = (((link_speed / wire_size) * ((rate == 0) ? 1.0 : rate)) / 100);
+	pps        = ((pps > 0) ? pps : 1);
+	cpb        = (rte_get_timer_hz() / pps) * (uint64_t)BURST_SIZE; /* Cycles per Burst */
+
+	tx_cycles = (uint64_t)nb_tx_lcores * cpb; //the number of tx_lcores matches the number of queues
+	RTE_LOG(INFO, FLOWGEN, "Port %u: tx_cycles set to %lu\n", portid, tx_cycles);
+
+	// port->tx_pps    = pps;
 }
 
 static void setup_packet(uint16_t portid, uint16_t dst_port, struct rte_mbuf *pkts[32], int i) {
@@ -84,6 +127,7 @@ static void setup_packet(uint16_t portid, uint16_t dst_port, struct rte_mbuf *pk
 
 static void generate_packets(struct rte_mempool *mbuf_pool) {
 	uint16_t portid;
+	uint64_t curr_tsc, tx_next_cycle;
     uint16_t dst_port = dst_port_start;
 
 	// Get the core id
@@ -103,37 +147,54 @@ static void generate_packets(struct rte_mempool *mbuf_pool) {
 	// uint16_t dst_port_end_lcore = dst_port_start_lcore + flows_per_lcore;
 	// uint16_t dst_port = dst_port_start_lcore;
 
+	curr_tsc      = rte_rdtsc_precise();
+	tx_next_cycle = curr_tsc;
+
 	while (keep_running) {
-		RTE_ETH_FOREACH_DEV(portid) {
-			if (!rte_eth_dev_is_valid_port(portid)) {
-				continue;
-			}
-			struct rte_mbuf *pkts[BURST_SIZE];
-			int nb_pkts = rte_pktmbuf_alloc_bulk(mbuf_pool, pkts, BURST_SIZE);
+		curr_tsc = rte_rdtsc_precise();
+		#if DEBUG
+		// if (unlikely(tx_next_cycle<curr_tsc)){
+		if (tx_next_cycle<curr_tsc){
+			// RTE_LOG(WARNING, FLOWGEN, "curr_tsc: %lu, tx_next_cycle: %lu, tx_cycles: %lu\n", curr_tsc, tx_next_cycle, tx_cycles);
+			uint64_t delay = curr_tsc - tx_next_cycle;
+			RTE_LOG(WARNING, FLOWGEN, "WARNING: Falling behind! Delay: %lu cycles\n", delay);
+		}
+		#endif
+		if (curr_tsc >= tx_next_cycle) {
+			tx_next_cycle = curr_tsc + tx_cycles;
+			// continue;
 
-			if (nb_pkts < 0) {
-				printf("Failed to allocate %d mbufs\n", BURST_SIZE);
-				continue;
-			}
-			for (int i = 0; i < BURST_SIZE; i++) {
-				setup_packet(portid, dst_port, pkts, i);
-				// Increase dst_port to generate more flows
-				dst_port++;
-				if (dst_port >= dst_port_start + num_flows) {
-					dst_port = dst_port_start;
+			RTE_ETH_FOREACH_DEV(portid) {
+				if (!rte_eth_dev_is_valid_port(portid)) {
+					continue;
 				}
+				struct rte_mbuf *pkts[BURST_SIZE];
+				int nb_pkts = rte_pktmbuf_alloc_bulk(mbuf_pool, pkts, BURST_SIZE);
+
+				if (nb_pkts < 0) {
+					printf("Failed to allocate %d mbufs\n", BURST_SIZE);
+					continue;
+				}
+				for (int i = 0; i < BURST_SIZE; i++) {
+					setup_packet(portid, dst_port, pkts, i);
+					// Increase dst_port to generate more flows
+					dst_port++;
+					if (dst_port >= dst_port_start + num_flows) {
+						dst_port = dst_port_start;
+					}
+				}
+
+				uint16_t to_send = BURST_SIZE;
+				uint16_t nb_tx = 0;
+				int sent;
+				do {
+					sent = rte_eth_tx_burst(portid, tx_queue_id, pkts, to_send);
+					to_send -= sent;
+					nb_tx += sent;
+				} while (to_send > 0);
+
+				lcore_pkt_counts[lcore_id] += nb_tx;
 			}
-
-			uint16_t to_send = BURST_SIZE;
-			uint16_t nb_tx = 0;
-			int sent;
-			do {
-				sent = rte_eth_tx_burst(portid, tx_queue_id, pkts, to_send);
-				to_send -= sent;
-				nb_tx += sent;
-			} while (to_send > 0);
-
-			lcore_pkt_counts[lcore_id] += nb_tx;
 		}
 	}
 	RTE_LOG(INFO, FLOWGEN, "Stopping packet transmission on lcore %u\n", rte_lcore_id());
@@ -143,7 +204,7 @@ static void generate_packets(struct rte_mempool *mbuf_pool) {
 static int send_packets_on_lcore(__attribute__((unused)) void *arg) {
 	u_int16_t lcore_id = rte_lcore_id();
 
-	RTE_LOG(INFO, FLOWGEN,"Lcore %u transmitting on TX queue %u\n", lcore_id, lcore_to_tx_queue[lcore_id]);
+	RTE_LOG(INFO, FLOWGEN,"Lcore %u transmitting on TX queue %u, TSC frequency: %lu Hz\n", lcore_id, lcore_to_tx_queue[lcore_id], rte_get_tsc_hz());
 
 	struct rte_mempool *mbuf_pool = (struct rte_mempool *)arg;  // Using the same mbuf pool
 
@@ -284,6 +345,56 @@ static int stats_monitoring_lcore(__attribute__((unused)) void *arg) {
 	return 0;
 }
 
+static void print_usage(const char *progname) {
+	printf("Usage: %s [EAL options] -- -r <rate> -f <num_flows>\n", progname);
+	printf("  -r <rate> : Set the rate as a double (e.g., 1.0)\n");
+	printf("  -f <num_flows>: Set the number of flows. Default 1.\n");
+}
+
+int parse_flowgen_args(int argc, char **argv, double *rate, u_int16_t *count,u_int16_t *flows_count) {
+	int opt;
+	*rate = 0.0;  // Default value for rate
+	*count = 0;
+	*flows_count = 0;
+
+	while ((opt = getopt(argc, argv, "r:c:f:")) != -1) {
+		switch (opt) {
+			case 'f':
+				*flows_count = atoi(optarg);
+				break;
+			case 'r':
+				*rate = atof(optarg);
+				break;
+			case 'c':
+				*count = atoi(optarg);
+				break;
+			default:
+				print_usage(argv[0]);
+			return -1;
+		}
+	}
+
+	// Ensure all arguments are processed correctly
+	if (optind < argc) {
+		RTE_LOG(ERR, FLOWGEN, "Unknown arguments:\n");
+		while (optind < argc) {
+			printf("  %s\n", argv[optind++]);
+		}
+		return -1;
+	}
+
+	// Validate the rate
+	if (*rate <= 0) {
+		RTE_LOG(ERR, FLOWGEN, "Error: Rate must be a positive double.\n");
+		return -1;
+	}
+	if (*flows_count <=0) {
+		RTE_LOG(ERR, FLOWGEN, "Error: Flows must be greater than 0.\n");
+		return -1;
+	}
+	return 0;
+}
+
 int main(int argc, char *argv[]) {
     struct rte_mempool *mbuf_pool;
     unsigned nb_ports;
@@ -301,6 +412,19 @@ int main(int argc, char *argv[]) {
         rte_exit(EXIT_FAILURE, "Error with EAL initialization\n");
     }
     /* >8 End of initialization the Environment Abstraction Layer (EAL). */
+
+	// Adjust argc and argv to skip the EAL arguments
+	argc -= ret;
+	argv += ret;
+
+	// Parse the cmd line arguments
+
+	double rate;
+	uint16_t count;
+	if (parse_flowgen_args(argc, argv, &rate, &count, &num_flows) < 0) {
+		rte_exit(EXIT_FAILURE, "Invalid arguments\n");
+	}
+
 
     /* Check the number of ports to send on. */
     nb_ports = rte_eth_dev_count_avail();
@@ -324,6 +448,7 @@ int main(int argc, char *argv[]) {
 			rte_exit(EXIT_FAILURE, "Cannot init port %"PRIu16 "\n",
 					portid);
 		}
+		set_packet_rate(rate, portid);
 		RTE_LOG(INFO, FLOWGEN,"Configured port %"PRIu16 "\n", portid);
 	}
 	/* >8 End of initializing all ports. */
